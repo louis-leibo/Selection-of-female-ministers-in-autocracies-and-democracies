@@ -1,0 +1,810 @@
+---
+title: "Share of female ministers in autocracies and democraties. Logistic regression model"
+author: "Louis Leibovici"
+format: 
+  html:
+    from: markdown+emoji
+    page-layout: full
+    toc: true
+    toc-depth: 2
+self-contained: true 
+---
+
+# Setup 
+
+I import the required libraries:
+
+```{r setup, message=FALSE, warning=FALSE}
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(readr)
+library(tidymodels)
+library(LiblineaR)
+```
+
+I read the data set.
+
+```{r message=FALSE, warning=FALSE}
+df <- 
+    readr::read_csv("Data/df_consolidatingprogress_V1.csv") 
+```
+
+
+# Data Preparation
+
+Here, we will focus on the variables related to the BMR index, a binary measure that indicates whether a country is a democracy. 
+
+## Filter df to the years where the BMR index suffered a change compared to the previous year and create a new column, `bmr_transition`.
+
+To filter the years where the BMR index suffered a change compared to the previous year, I need to find the variable corresponding to the BMR index. Because the data frame contains 320 columns, I am using the `tidyselect::contains()` function to spot which variable I need to use. I am creating a new data set for this, called `df_bmr`.
+
+I can now use the the `lag()` function to filer `df` to the years where the BMR index changed compared to the previous year and then create a new string variable called `bmr_transition`. Afterwards, I filter the columns of the data set to only show `country_name`, `year` and `bmr_transition_type` and sort everything by country name and year in ascending order.
+
+```{r}
+df_bmr_changed <- 
+  df %>% 
+  filter(democracy_bmr != lag(democracy_bmr, default = first(democracy_bmr))) %>% 
+  mutate(bmr_transition = ifelse(democracy_bmr == 1, "Autocracy to Democracy", "Democracy to Autocracy")) %>% 
+  select(country_name, year, bmr_transition) %>% 
+  arrange(country_name, year)
+```
+
+## Focus on countries which faced more than one regime transition. Are there any inconsistencies in the data?
+
+Now, I want to know how many countries faced more than one regime transition during the time covered by the data set. 
+
+For this, I create a new data set called `df_q4` which depicts countries which faced more than one regime transition and the specific number of regime transition (bigger than 1) of each country. 
+
+```{r message=FALSE, warning=FALSE}
+df_q4 <- 
+  df_bmr_changed %>% 
+  select(country_name) %>% # to filter the data frame to only include the country_name variable
+  group_by(country_name) %>% 
+  count() %>% 
+  filter(n>1) %>% # to filter to have countries that appear more than once. 
+  arrange(desc(n)) %>%
+  knitr::kable()
+
+print(df_q4) 
+```
+
+From this data set, I can see that Thailand is the country which had the most regime transitions (8), Honduras and Niger come second with 6 regime transitions. 
+Interestingly, all these countries are developed countries. 
+
+Also, when looking at the `df_bmr_changed` data set, we can see that some countries faced a regime transition each year during consecutive years. For example, Bolivia went from autocracy to democracy in 1979, then from democracy to autocracy in 1980, before going back to democracy in 1982. Same thing for thee Honduras, which went from autocracy to democracy in 1971 before going back to autocracy in 1972 for example. Thailand changed of regime's type 3 times in less than 10 years (between 1975 and 1983). Ultimately, we can infer from that that the BMR index might not be very precise, and changes in regime type throughout multiple consecutive years is not as likely in real life as it appears in the data set. 
+
+In addition, most countries have data from 1967, but it is not the case for all countries. Indeed: 
+
+```{r}
+df_min_year <- 
+  df_bmr_changed
+
+df_min_year <- 
+  df_min_year %>% 
+  select(year, country_name) %>% 
+  group_by(country_name) %>%
+  mutate(min_year = min(year), max_year = max(year)) %>% 
+  summarise(year = min(year),
+              min_year = min(min_year),
+              max_year = max(max_year)) %>% 
+  select(country_name, min_year) %>% 
+  arrange(desc(min_year)) %>% 
+  knitr::kable()
+
+df_min_year %>% head(10)
+```
+
+We can see that there is data for South Sudan only from 2013, and for Timor-Leste only from 2003. There is a lot of missing data for these countries for example.  
+
+Ultimately, for all these reasons, there are some inconsistencies in the data. 
+
+
+# Creation of a baseline model
+
+In the paper that published this data set, the authors used a linear regression model to predict `share_female`-related variables.
+
+Here, I will tackle this as a classification task. I aim to create a logistic regression model to predict whether the share of females in the cabinet will increase or decrease in the next year.
+
+## Creation of a binary target variable and division of the data frame into a data set and a test test
+
+I create a binary target variable called `is_share_female_up` that I set to 1 if the share_female variable in the current year is 10% higher than the share_female variable in the previous year. Otherwise, I set this binary variable equal to 0.
+
+I then split the data set into two sets: I set the last year in the data set (2021) as the test set and use the previous years as the training set.
+
+```{r}
+df1 <- 
+    df %>% 
+    group_by(country_name) %>%
+    arrange(year) %>% 
+    mutate(
+      lag_1_share_female = lag(share_female, 1),
+      is_share_female_up = if_else(share_female > 1.1*lag_1_share_female, 1, 0),
+      is_share_female_up = factor(is_share_female_up, levels=c("0", "1"))
+    ) %>%
+    drop_na(is_share_female_up) %>%
+    arrange(country_name, year)
+
+df1_train <- df1 %>% filter(year < 2021)
+df1_test <- df1 %>% filter(year == 2021)
+```
+
+## Creation of a logistic regression model using a single predictor
+
+I now create a logistic regression model using a single predictor. 
+
+I choose `lag_1_share_female` as the single predictor. This is a valid predictor, as it is a lagged variable and the model will therefore use historical values of share of female to make predictions. As it is requested to use a single valid predictor, I believe that it is one of the most appropriate variables to use, as the model will use past values and trends of the share of female to predict future shares of female, even though the predictions will lack precision for sure. For example, we do not include `country_name`, so the model will make predictions based on an aggregation of all countries. 
+
+```{r}
+logistic_model1 <-
+  logistic_reg() %>%
+  set_engine("glm") %>%
+  fit(is_share_female_up ~ lag_1_share_female, data=df1)
+```
+
+I want to plot the output of the model to better understand what it represents: 
+
+For the training set, let's plot the relationship between the probability of the share of female going up and the share of female 1 year ago: : 
+```{r plot, message=FALSE, warning=FALSE}
+plot_df1_train <- logistic_model1 %>% augment(df1_train)
+
+min_x <- plot_df1_train %>% filter(lag_1_share_female == min(lag_1_share_female)) %>% slice(1)
+max_x <- plot_df1_train %>% filter(lag_1_share_female == max(lag_1_share_female)) %>% slice(1)
+
+g_train <- (
+  ggplot(plot_df1_train, aes(x = lag_1_share_female, y=.pred_1, color=country_name)) +
+  geom_point(size=1, alpha=0.3, stroke=1, show.legend = FALSE) + # I hide the legend (country names) because there are so many countries that it is not relevant anymore
+  labs(x = "Share female 1 year ago", 
+       y = "Probability of share female going up",
+       title="Logistic regression is a good model for this problem",
+       subtitle="The predictions are bounded between 0 and 1") + 
+  theme_bw()
+)
+g_train
+
+```
+
+-> this graph allows me to see that a logistic regression is a good model for this problem ! Indeed, the plot shows a linear regression line, which means that the model is able to learn the relationships in the data. 
+
+For the testing set, let's also plot the relationship between the probability of the share of female going up and the share of female 1 year ago: 
+```{r message=FALSE, warning=FALSE}
+plot_df1_test <- logistic_model1 %>% augment(df1_test)
+
+min_x <- plot_df1_test %>% filter(lag_1_share_female == min(lag_1_share_female)) %>% slice(1)
+max_x <- plot_df1_test %>% filter(lag_1_share_female == max(lag_1_share_female)) %>% slice(1)
+
+g_test <- (
+  ggplot(plot_df1_test, aes(x = lag_1_share_female, y=.pred_1, color=country_name)) +
+  geom_point(size=1, alpha=0.3, stroke=1, show.legend = FALSE) + # I hide the legend (country names) because there are so many countries that it is not relevant anymore
+  labs(x = "Share female 1 year ago", 
+       y = "Probability of share female going up",
+       title="Logistic regression is a good model for this problem",
+       subtitle="The predictions are bounded between 0 and 1") + 
+  theme_bw()
+)
+g_test
+```
+
+## Evaluation of the model's performance
+
+The best summary is the confusion matrix, a table that shows how many times the model got it right and how many times it got it wrong. To create it, I use the `conf_mat` function from the `yardstick` package. 
+
+I choose this metric because it plots a table of all the predicted and actual values of a classifier, which makes the analysis very easy. Indeed, it provides a detailed view of the model's performance by dividing the predictions into four categories: 
+True Positives (TP): The number of times the model correctly predicted a Yes outcome.
+True Negatives (TN): The number of times the model correctly predicted a No outcome.
+False Positives (FP): The number of times the model incorrectly predicted a Yes outcome.
+False Negatives (FN): The number of times the model incorrectly predicted a No outcome.
+
+The confusion matrix can therefore also be used to identify where my model is struggling to build good predictions. For example, I could easily see that the model is only predicting positives.  
+
+In addition, with the confusion matrix, I can calculate other common metrics such as: 
+Accuracy: The proportion of correct predictions. It is calculated as the sum of the diagonal divided by the sum of all values in the matrix.
+Precision: The proportion of Yes predictions made by the model that were actually correct.
+Recall: The proportion of true Yes outcomes that were predicted by the model, correctly, as Yes.
+F1-score: A metric that combines precision and recall. This score ranges from 0 to 1, 1 being the best. It is calculated as: 
+$$
+2 \times \frac{precision \times recall}{precision + recall}
+$$
+
+For the training set: 
+```{r message=FALSE, warning=FALSE}
+logistic_model1 %>% 
+  augment(df1_train) %>%
+  conf_mat(truth=is_share_female_up, estimate=.pred_class) %>%
+  autoplot(type="heatmap") +
+  scale_fill_gradient(low="#D6EAF8",high = "#2E86C1")
+
+```
+
+For the testing set: 
+```{r message=FALSE, warning=FALSE}
+logistic_model1 %>% 
+  augment(df1_test) %>%
+  conf_mat(truth=is_share_female_up, estimate=.pred_class) %>%
+  autoplot(type="heatmap") +
+  scale_fill_gradient(low="#D6EAF8",high = "#2E86C1")
+```
+
+important to note that: by default, the threshold is set at probability=0.5, which means that if the probability is 50% or higher, the model predicts: yes, the share of female goes up.  
+
+When the prediction is set at the 50% level, here is what we get: 
+
+For the training set: 
+When the share of female did not go up, and the model predicted that the share of female does not go up, the model was therefore right. This is what is represented at the lop left of the table and this happened 6,753 times. 
+When the share of female did not go up, and the model predicted that the share of female goes up, the model was therefore wrong. This is what is represented at the top right of the table, and this happened 1,647 times. 
+
+For the testing set: 
+When the share of female did not go up, and the model predicted that the share of female does not go up, the model was therefore right. This is what is represented at the lop left of the table and this happened 133 times. 
+When the share of female did not go up, and the model predicted that the share of female goes up, the model was therefore wrong This is what is represented at the top right of the table, and this happened 38 times. 
+
+
+From these tables, we can see that the model does not predict no true positives nor false positives, which means that it only predicts negatives. The model predicts low probabilities of having a positive case. We might therefore want to use another threshold (different to 0.5). 
+
+
+I can also evaluate this confusion matrix in terms of numbers: however, we will see that given the fact that we have no true positive or false positives, this is not the best way to evaluate the model: 
+
+For the training set: 
+```{r message=FALSE, warning=FALSE}
+logistic_model1 %>% 
+  augment(df1_train) %>%
+  conf_mat(truth=is_share_female_up, estimate=.pred_class) %>%
+  summary(estimator="binary", event_level="second") %>%
+  knitr::kable()
+```
+
+For the testing set: 
+```{r message=FALSE, warning=FALSE}
+logistic_model1 %>% 
+  augment(df1_test) %>%
+  conf_mat(truth=is_share_female_up, estimate=.pred_class) %>%
+  summary(estimator="binary", event_level="second") %>%
+  knitr::kable()
+```
+
+Usually, when looking at these performance metrics, we are interested in accuracy, precision, recall, and the F1-score.
+
+Firstly, the accuracy represents the proportion of correct predictions. It is calculated as the sum of the diagonal divided by the sum of all values in the matrix. For both sets, the accuracy of the model is high (0.80 and 0.77), as a large proportion of negatives predicted by the model was true negatives. However, accuracy is not a good measure if the data set is not balanced, and the data set is not balanced at all here, as negative and positive classes do not have drastically different number of data points. 
+
+The precision, which represents the proportion of Yes predictions made by the model that were actually correct (True positives) out of the total true and false positives, should be close to 1 for a good model. However, here, the precision cannot be calculated for both data sets, as we have no true positive or false positives. 
+Recall, which represents the proportion of Yes Predictions that were actually correct out of the total of true positives and false negatives, should ideally be close to 1 for a good model. However, here recall cannot be calculated for both data sets, as we have no true positives. 
+
+Finally, the F1-score, the metric that we were looking for and that combines precision and recall cannot be calculated neither, as we have no true positive or false positives. It therefore confirms that evaluating this confusion matrix in terms of numbers is not the right way here. Evaluating it visually is easier and more pertinent. 
+
+Overall, because there are no true positives or false positives, the model only predicts negatives. This means that the predictions are all below the threshold, which is automatically equal to 0.5. One way to improves the model would therefore be to reduce the threshold, to have more balanced predictions. (cf part 3). 
+
+## Explanation of the regression coefficients
+
+I can look at the coefficients: 
+```{r}
+logistic_model1$fit 
+```
+
+so, we know that: 
+$$
+\beta_0 \approx -1.4265 
+$$
+and 
+$$
+\beta_1 \approx 1.911\times10^{-3}
+$$
+These coefficient mean that:
+
+- In the case where the share of female was zero, the probability of the share of female going up in the current year is: 
+$$
+ \frac{e^{-1.4265}}{1 + e^{-1.4265}} \approx 0.1936
+$$
+
+- For every 1 unit increase in the share of female 1 year ago, the probability of the share of female going up increases by a factor of : 
+$$
+\approx 1.911\times10^{-3}
+$$
+
+
+## Goodness-of-fit of the model and the model's predictive power
+
+**Goodness-of-fit**
+
+To visualise the goodness-of-fit of this solution, let's plot the ROC Curve, which shows  what would happen to the model if we chose different thresholds.
+
+For the training set: 
+```{r echo=FALSE, message=FALSE}
+logistic_model1 %>% 
+  augment(df1_train) %>%
+  roc_curve(truth=is_share_female_up, .pred_1, event_level="second") %>%
+  autoplot() + 
+  geom_point(aes(x=1-specificity, y=sensitivity, color=.threshold)) + 
+  scale_color_gradient(name="Threshold", low = "#c6733c", high="#3cc6b8", limits=c(0, 1)) + 
+  labs(title="ROC curve",
+       x="(1 - specificity) = 1 - TN/N",
+       y="(sensitivity) = TP/P")
+```
+
+Given the ROC curve, we want to choose a threshold to get to the furthest point above the 45-degree line and closest to the top left corner. The 45 degrees line shows all the points where the model's predictions are as good as random. The furthest point above the 45-degree line and closest to the top left corner seems to roughly be the point (0.625,0.75), where we correctly label 75% of the cases with a false positive rate of 62.5%. Ideally, the best threshold would therefore be in a brown threshold zone, and therefore be less than 0.25. 
+
+For the testing set: 
+```{r echo=FALSE, message=FALSE}
+logistic_model1 %>% 
+  augment(df1_test) %>%
+  roc_curve(truth=is_share_female_up, .pred_1, event_level="second") %>%
+  autoplot() + 
+  geom_point(aes(x=1-specificity, y=sensitivity, color=.threshold)) + 
+  scale_color_gradient(name="Threshold", low = "#c6733c", high="#3cc6b8", limits=c(0, 1)) + 
+  labs(title="ROC curve",
+       x="(1 - specificity) = 1 - TN/N",
+       y="(sensitivity) = TP/P")
+```
+
+The ROC curve of the training set shows many points that are below the 45-degree line, which means that a random guess would be better ! The model does not make good predictions for the training set.
+
+Given the ROC curve, we want to choose a threshold to get to the further point above the 45 degrees line and closest to the top left corner, which is roughly the point (0.60,0.74), where we  correctly label 74% of the cases with a false positive rate of 60%. Again, given the graph, the best threshold for this model would therefore be in a brown threshold zone, and therefore be less than 0.25.
+
+Finally, we can see that the model fits the training data better than the testing data. 
+
+**Predictive power**
+
+To calculate the predictive power of the model, we calculate the Area Under the Curve:
+
+For the training set:
+```{r echo=FALSE, message=FALSE}
+logistic_model1 %>% 
+  augment(df1_train) %>%
+  roc_auc(truth=is_share_female_up, .pred_1, event_level="second") %>%
+  knitr::kable()
+```
+
+For the testing set: 
+```{r echo=FALSE, message=FALSE}
+logistic_model1 %>% 
+  augment(df1_test) %>%
+  roc_auc(truth=is_share_female_up, .pred_1, event_level="second") %>% 
+  knitr::kable()
+```
+
+The Area Under the Curve provides an aggregate measure of performance across all possible classification thresholds. The Area Under the Curve is the probability that the model ranks a random positive example more highly than a random negative example. The closer to 1 the AUC is, the better predictions the model has. 
+
+For the training set, the Area under the curve is 0.545, which means that the model ranks a random positive example higher than a random negative example roughly 54.5% of the time. As such, the predictive ability is not a lot better than random guessing (50% of the time).
+
+For the testing set, the Area under the curve is 0.465, which means that the model ranks a random positive example higher than a random negative example roughly 46.5% of the time. As such, the predictive ability is worse than random guessing (50% of the time).
+
+Also, the model fits the training data better than the testing data. There are no surprises here, this is what usually happens. 
+
+# Improving the model's performance
+
+In this part, I am going to find ways to improve the model's performance. 
+
+Part A: Firstly, I am going to add dummy variables accounting for each country to the model to build predictions based on each country and not on an aggregate of all countries. I choose to do this as it will add more predictors to the model and I believe that dummy variables for each country will improve the model. Indeed, it will allow us to account for different trends in `share_female` between the countries and will take this into account to predict the `share_female` variable. 
+
+Part B: Secondly, I will find another threshold for the model built in Part A of Part 3 to have more balanced predictions, which might allow us to compute a F1-score. I choose to do this as the threshold set by default (0.5) is certainly not the best one, meaning that there are other thresholds that will improve the model's predictions. I will try to find the threshold that maximises the F1-score.
+
+Part C: Thirdly, I will add other predictors (lagged variables of `share_female`) to the model created in Part A of Part 3. I will evaluate this model's performance and compare it to the baseline model (Part 2) and the model created in Part A of Part 3. I believe that adding lagged variables of `share_female` will improve the model's performance, as the model will now take historical values of `share_female` to make predictions instead of taking only the previous year's `share_female` value.
+
+## Part A: Adding dummy variables
+
+I create a new recipe that predicts `is_share_female_up` using: `lag_1_share_female` and `country_name`, `country_name` being a dummy variable. 
+
+```{r}
+rec_dummy <-
+  recipe(is_share_female_up ~ lag_1_share_female + country_name, data=df1_train) %>%
+  step_dummy(country_name) %>%
+  prep()
+
+```
+
+I then create a `logistic_model2`:
+
+```{r}
+logistic_model2_workflow <-
+  workflow() %>%
+  add_recipe(rec_dummy) %>%
+  add_model(logistic_reg() %>% set_engine("glm")) %>%
+  fit(df1_train)
+
+logistic_model2 <- logistic_model2_workflow %>% extract_fit_parsnip()
+
+logistic_model2$fit
+```
+
+Looking at the coefficients of this new model and comparing with the coefficients of the baseline model is interesting. Indeed, Beta 0 is roughly the same in both models. However, Beta 1 is not the same: 0.001911 in the baseline model and -0.01308 in this new model. This new model is more precise as adding `country_name` dummy variables allows to have precise estimates for each country. This is why Beta 1 is not the same in both models:  adding country dummy variables adds another variable for each country, which complements Beta 1 in the sense that the dummy variable adds a lot of weight to the regression output (the majority of country dummy variables are larger than 0.1 or smaller than -0.1, which is very significant in comparison the Beta 1). 
+
+I am now going to analyse whether this is a better or a worse model: 
+
+For the training set:
+```{r echo=FALSE, message=FALSE}
+logistic_model2_workflow %>% 
+  augment(df1_train) %>%
+  group_by(.pred_class, is_share_female_up) %>%
+  tally() %>%
+  tidyr::pivot_wider(values_from=n, names_from="is_share_female_up") %>% 
+  knitr::kable()
+  
+```
+
+and to have a more visual representation, let's compute the confusion matrix: 
+
+```{r echo=FALSE, message=FALSE}
+logistic_model2 %>% 
+  augment(rec_dummy %>% bake(df1_train)) %>% 
+  conf_mat(truth=is_share_female_up, estimate=.pred_class) %>%
+  autoplot(type="heatmap") +
+  scale_fill_gradient(low="#D6EAF8",high = "#2E86C1")
+```
+
+For the testing set:
+
+```{r echo=FALSE, message=FALSE}
+logistic_model2 %>% 
+  augment(rec_dummy %>% bake(df1_test)) %>% 
+  conf_mat(truth=is_share_female_up, estimate=.pred_class) %>%
+  autoplot(type="heatmap") +
+  scale_fill_gradient(low="#D6EAF8",high = "#2E86C1")
+```
+
+For both the training and the testing sets, the confusion matrix has not changed, as compared with the confusion matrix of the model without the dummy variables (model in Part 2). 
+
+Indeed, there are still no true positives or false positives, which means that the model only predicts negatives for a 0.5 threshold. The model predicts low probabilities of having a positive case. We might therefore want to use another threshold (different to 0.5). 
+
+
+However, the model with the dummy variables might still make better predictions than the previous model. To check this and to visualise the goodness-of-fit of this solution, let's plot the ROC Curve, which shows  what would happen to the model if we chose different thresholds.
+
+For the training set: 
+```{r echo=FALSE, message=FALSE}
+logistic_model2 %>% 
+  augment(rec_dummy %>% bake(df1_train)) %>% 
+  roc_curve(truth=is_share_female_up, .pred_1, event_level="second") %>%
+  autoplot() + 
+  geom_point(aes(x=1-specificity, y=sensitivity, color=.threshold)) + 
+  scale_color_gradient(name="Threshold", low = "#c6733c", high="#3cc6b8", limits=c(0, 1)) + 
+  labs(title="ROC curve",
+       x="(1 - specificity) = 1 - TN/N",
+       y="(sensitivity) = TP/P")
+```
+
+For the testing set: 
+```{r echo=FALSE, message=FALSE}
+logistic_model2 %>% 
+  augment(rec_dummy %>% bake(df1_test)) %>% 
+  roc_curve(truth=is_share_female_up, .pred_1, event_level="second") %>%
+  autoplot() + 
+  geom_point(aes(x=1-specificity, y=sensitivity, color=.threshold)) + 
+  scale_color_gradient(name="Threshold", low = "#c6733c", high="#3cc6b8", limits=c(0, 1)) + 
+  labs(title="ROC curve",
+       x="(1 - specificity) = 1 - TN/N",
+       y="(sensitivity) = TP/P")
+```
+
+We can see that both ROC curves have changed. The Area under the Curve of both sets seem to be higher than in the model in Part 2, which therefore mean that the model with dummy variables performs better  across all possible classification thresholds than the model in Part 2. 
+
+Indeed, there are only a few points on the ROC curve of the training set below the 45-degree line, which is a good improvement. In addition, the ROC curve of the testing set seems to be further to the top left corner than the ROC curve computed in Part 2. 
+
+To check these observations and get the predictive power of the model, we calculate the Area Under the Curve:
+
+For the training set:
+```{r echo=FALSE, message=FALSE}
+logistic_model2 %>% 
+  augment(rec_dummy %>% bake(df1_train)) %>% 
+  roc_auc(truth=is_share_female_up, .pred_1, event_level="second") %>%
+  knitr::kable()
+```
+
+For the testing set:
+```{r echo=FALSE, message=FALSE}
+logistic_model2 %>% 
+  augment(rec_dummy %>% bake(df1_test)) %>% 
+  roc_auc(truth=is_share_female_up, .pred_1, event_level="second") %>%
+  knitr::kable()
+```
+
+As we expected, the AUC scores of both the training and the testing sets have indeed increased. 
+
+For the training set, the Area under the curve increased from 0.545 to 0.646, meaning that the model with dummy variables ranks a random positive example higher than a random negative example roughly 64.6% of the time, which is better than 54.5% of the time as in the model of Part 2. 
+
+For the testing set, the Area under the curve increased from 0.465 to 0.5596, meaning that the predictive ability of the model with dummy variables is now better than random guessing (50% of the time), which was not the case in the model of Part 2.
+
+Also, again, the model fits the training data better than the testing data.
+
+
+## Part B: Finding the perfect threshold and comparing the model's performance with this threshold to a 0.5 threshold.
+
+With a 0.5 threshold, the F1-score was equal to N/A because the model did not predict false positives nor true positives. Computing the F1-score for the training and testing sets of the model with dummy variables (Part A of Part 3) would result in F1-scores equal to N/A, as the confusion matrix for a 0.5 threshold have not changed between the two models.
+
+On the improved model that includes country dummy variables (Part A of Part 3), I am going to see whether a different threshold can produce false positives and true positives to therefore have a F1-score different to N/A. 
+
+For this, I am going to run a loop to find which threshold gives the highest F1-score and therefore give a more balanced model, calculating false positives and true positives as well: 
+
+```{r output=FALSE}
+best_threshold <- 0 
+best_score_train <- 0 
+
+threshold_function <- function(my_threshold){ 
+  metrics11 <- logistic_model2 %>% 
+    augment(rec_dummy %>% bake(df1_test)) %>% 
+    mutate(.pred_class= .pred_1 > my_threshold, 
+           .pred_class=factor(.pred_class, 
+                              labels=c("0","1"), 
+                              levels=c(FALSE, TRUE),
+                              ordered=TRUE)) %>%
+    conf_mat(truth=is_share_female_up, estimate=.pred_class) %>% 
+    summary(estimator="binary", event_level="second")
+  print(metrics11)
+
+metrics11 %>%
+  filter(.metric =='f_meas') %>% 
+  pull(.estimate)
+}
+
+#use loop to test different thresholds
+
+for (i in 1:99){ 
+  my_threshold <- i/100
+  current_score <- threshold_function(my_threshold)
+  if(is.na(current_score)) {
+    current_score=0
+  }
+  if(as.numeric(current_score) > as.numeric(best_score_train)) {
+    best_score_train <- current_score
+    best_threshold <- max(my_threshold, best_threshold)
+  }
+}
+
+```
+
+We find that the threshold that maximises the F1-score of this model is: 
+```{r}
+best_threshold
+```
+
+This is consistent with what we saw on the ROC curve above, the threshold colors indicating a threshold of roughly less than 0.25. 
+
+With a threshold of 0.19, let's have a look at the confusion matrix:  
+
+For the training set: 
+```{r message=FALSE, warning=FALSE}
+my_threshold <- 0.19
+
+logistic_model2 %>% 
+  augment(rec_dummy %>% bake(df1_train)) %>% 
+  mutate(.pred_class = .pred_1 > my_threshold,
+           .pred_class = factor(.pred_class, 
+                                labels=c("0","1"), 
+                                levels=c(FALSE, TRUE), 
+                                ordered=TRUE)) %>%
+    conf_mat(truth=is_share_female_up, estimate=.pred_class) %>%
+    autoplot(type="heatmap") +
+    scale_fill_gradient(low="#D6EAF8",high = "#2E86C1")
+
+```
+
+From the confusion matrix of the training set, we can see that the model now also predicts true positives and false positives, which gives more balanced predictions and is a good improvement from the baseline model. 
+
+The model is quite good at predicting negatives, as it predicts only 461 false negative and 3,307 true negative. 
+However, the model is bad at predicting positives, as it predicts 3,446 false positives and 1,186 true positives. 
+
+For the testing set: 
+```{r message=FALSE, warning=FALSE}
+my_threshold <- 0.19
+
+logistic_model2 %>% 
+  augment(rec_dummy %>% bake(df1_test)) %>% 
+  mutate(.pred_class = .pred_1 > my_threshold,
+           .pred_class = factor(.pred_class, 
+                                labels=c("0","1"), 
+                                levels=c(FALSE, TRUE), 
+                                ordered=TRUE)) %>%
+    conf_mat(truth=is_share_female_up, estimate=.pred_class) %>%
+    autoplot(type="heatmap") +
+    scale_fill_gradient(low="#D6EAF8",high = "#2E86C1")
+
+```
+
+From the confusion matrix of the testing set, we can see that the model now also predicts true positives and false positives, which gives more balanced predictions and is a good improvement from the baseline model.
+
+For the testing set, we can write the same observations as for the training set: the model is quite good at predicting negatives, but is bad at predicting positives. 
+
+
+Let's compute the various metrics given this threshold of 0.19 that maximises the F1-score of the model: 
+
+For the training set: 
+```{r message=FALSE, warning=FALSE}
+my_threshold <- 0.19
+
+logistic_model2 %>% 
+  augment(rec_dummy %>% bake(df1_train)) %>% 
+  mutate(.pred_class = .pred_1 > my_threshold,
+           .pred_class = factor(.pred_class, 
+                                labels=c("0","1"), 
+                                levels=c(FALSE, TRUE), 
+                                ordered=TRUE)) %>%
+    conf_mat(truth=is_share_female_up, estimate=.pred_class) %>%
+    summary(estimator="binary", event_level="second") %>% 
+    knitr::kable()
+```
+
+For the testing set: 
+```{r message=FALSE, warning=FALSE}
+my_threshold <- 0.19
+
+logistic_model2 %>% 
+  augment(rec_dummy %>% bake(df1_test)) %>% 
+  mutate(.pred_class = .pred_1 > my_threshold,
+           .pred_class = factor(.pred_class, 
+                                labels=c("0","1"), 
+                                levels=c(FALSE, TRUE), 
+                                ordered=TRUE)) %>%
+    conf_mat(truth=is_share_female_up, estimate=.pred_class) %>%
+    summary(estimator="binary", event_level="second") %>% 
+    knitr::kable()
+```
+
+Usually, when looking at these performance metrics, we are interested in accuracy, precision, recall, and the F1-score. Now that the predictions of the model are more balanced, the precision, recall and F1-score are computed. Not surprisingly, the accuracy have decrease in both sets, which comes from the fact that the model now also predicts positives. 
+The F1-score, the metric that combines precision and recall, is low for both sets:  0.38 for the training set and 0.39 for the testing set. This denotes  a low-quality classifier
+
+## Part C: Adding other predictors to the dummy variables model
+
+Now, I am going to add other predictors to the model to (I hope) increase the performance of the model. We want to predict whether the share of females in the cabinet will increase or decrease in the next year, but apart from the share of female in the previous year, and the country dummy variables, there is no other predictor in the model for now. 
+
+I am therefore going to add other `share_female` lagged variables to improve the performance of the model. The model will now take historical values (10 previous years values) of `share_female` to make predictions instead of taking only the previous year's `share_female` value.
+
+Firstly, I add the lagged variables prior to creating the recipe: 
+
+```{r}
+df2 <- 
+    df %>% 
+    group_by(country_name) %>%
+    arrange(year) %>% 
+    mutate(
+      lag_1_share_female = lag(share_female, 1),
+      lag_2_share_female = lag(share_female, 2),
+      lag_3_share_female = lag(share_female, 3),
+      lag_4_share_female = lag(share_female, 4),
+      lag_5_share_female = lag(share_female, 5),
+      lag_6_share_female = lag(share_female, 6),
+      lag_7_share_female = lag(share_female, 7),
+      lag_8_share_female = lag(share_female, 8),
+      lag_9_share_female = lag(share_female, 9),
+      lag_10_share_female = lag(share_female, 10),
+      is_share_female_up = if_else(share_female > 1.1*lag_1_share_female, 1, 0),
+      is_share_female_up = factor(is_share_female_up, levels=c("0", "1"))
+    ) %>%
+    drop_na(is_share_female_up, lag_1_share_female, lag_2_share_female, lag_3_share_female, lag_4_share_female, lag_5_share_female, lag_6_share_female, lag_7_share_female, lag_8_share_female, lag_9_share_female, lag_10_share_female) %>%
+    arrange(country_name, year)
+
+df2_train <- df2 %>% filter(year < 2021)
+df2_test <- df2 %>% filter(year == 2021)
+```
+
+I create a new recipe: 
+
+```{r}
+rec_dummy_lag <-
+  recipe(is_share_female_up ~ lag_1_share_female + lag_2_share_female + lag_3_share_female + lag_4_share_female + lag_5_share_female + lag_6_share_female + lag_7_share_female + lag_8_share_female + lag_9_share_female + lag_10_share_female + country_name, data=df2_train) %>%
+  step_dummy(country_name) %>%
+  prep()
+
+```
+
+I then create a `logistic_model3`::
+
+```{r}
+logistic_model3_workflow <-
+  workflow() %>%
+  add_recipe(rec_dummy_lag) %>%
+  add_model(logistic_reg() %>% set_engine("glm")) %>%
+  fit(df2_train)
+
+logistic_model3 <- logistic_model3_workflow %>% extract_fit_parsnip()
+
+```
+
+To evaluate the model's performance and know whether this a better or a worse model, I first plot the ROC curve and then calculate the AUC for both data sets. 
+
+To visualise the goodness-of-fit of this model, let's plot the ROC Curve, which shows  what would happen to the model if we chose different thresholds.
+
+For the training set: 
+```{r echo=FALSE, message=FALSE}
+logistic_model3 %>% 
+  augment(rec_dummy_lag %>% bake(df2_train)) %>% 
+  roc_curve(truth=is_share_female_up, .pred_1, event_level="second") %>%
+  autoplot() + 
+  geom_point(aes(x=1-specificity, y=sensitivity, color=.threshold)) + 
+  scale_color_gradient(name="Threshold", low = "#c6733c", high="#3cc6b8", limits=c(0, 1)) + 
+  labs(title="ROC curve",
+       x="(1 - specificity) = 1 - TN/N",
+       y="(sensitivity) = TP/P")
+```
+
+For the testing set: 
+```{r echo=FALSE, message=FALSE}
+logistic_model3 %>% 
+  augment(rec_dummy_lag %>% bake(df2_test)) %>% 
+  roc_curve(truth=is_share_female_up, .pred_1, event_level="second") %>%
+  autoplot() + 
+  geom_point(aes(x=1-specificity, y=sensitivity, color=.threshold)) + 
+  scale_color_gradient(name="Threshold", low = "#c6733c", high="#3cc6b8", limits=c(0, 1)) + 
+  labs(title="ROC curve",
+       x="(1 - specificity) = 1 - TN/N",
+       y="(sensitivity) = TP/P")
+```
+
+We can see that both ROC curves have changed. The Area under the Curve of both sets seem to be higher than in the previous model, which would mean that the model's performance is improved. Also, the threshold colors have changed. 
+
+To evaluate the predictive power of this new model, we calculate the Area Under the Curve:
+
+For the training set:
+```{r echo=FALSE, message=FALSE}
+logistic_model3 %>% 
+  augment(rec_dummy_lag %>% bake(df2_train)) %>% 
+  roc_auc(truth=is_share_female_up, .pred_1, event_level="second") %>%
+  knitr::kable()
+```
+
+For the testing set:
+```{r echo=FALSE, message=FALSE}
+logistic_model3 %>% 
+  augment(rec_dummy_lag %>% bake(df2_test)) %>% 
+  roc_auc(truth=is_share_female_up, .pred_1, event_level="second") %>%
+  knitr::kable()
+```
+
+As we expected, the AUC scores have again increased. 
+
+For the training set, the Area under the curve increased from 0.646 (model Part A of Part C) to 0.697.
+For the testing set, the Area under the curve increased from 0.5596 (model Part A of Part C) to 0.663.
+
+This model is therefore the best model when compared with the baseline model or the model of Part A of Part C. 
+
+Also, again, the model fits the training data better than the testing data.
+
+For a 0.5 threshold: 
+
+For the training set: 
+```{r message=FALSE, warning=FALSE}
+logistic_model3 %>% 
+  augment(rec_dummy_lag %>% bake(df2_train)) %>% 
+  conf_mat(truth=is_share_female_up, estimate=.pred_class) %>%
+  autoplot(type="heatmap") +
+  scale_fill_gradient(low="#D6EAF8",high = "#2E86C1")
+```
+
+For the testing set:
+
+```{r message=FALSE, warning=FALSE}
+logistic_model3 %>% 
+  augment(rec_dummy_lag %>% bake(df2_test)) %>% 
+  conf_mat(truth=is_share_female_up, estimate=.pred_class) %>%
+  autoplot(type="heatmap") +
+  scale_fill_gradient(low="#D6EAF8",high = "#2E86C1")
+```
+
+For both training and testing sets, even with a 0.5 threshold, the model seems to make good predictions. As compared with the model of Part B of Part 3 (model which includes country dummy variables and with threshold maximising the F1-score to have more balanced predictions): 
+
+- there are now more true positives than false positives (83 true positives vs 59 false positives for the training set and 4 vs 3 for the testing set), which was not the case in the  model of Part B of Part 3 (1,186 true positives vs 3,446 false positives for the training set and 21 vs 49 for the testing set). 
+- there are a lot more true negatives in both sets than in the model of Part B of Part 3.
+- there are a lot more negative predictions than positive predictions (which might come from the fact that it is a 0.5 threshold here).
+
+Overall, these predictions are therefore better than in the models of Part A and Part B of Part 3. 
+
+
+**Conclusion**
+I created a model to predict `share_female` variable. 
+
+The baseline model created used only a single predictor, a lagged variable of `share_female`. Not surprisingly, the model does not make good predictions and for a 0.5 threshold, the model only predicts negatives (false negatives and true negatives). The ROC curves showed that the model did not make good predictions, the ROC curve of the testing even showed that a random guess would be better than the predictions of the model.
+
+In the last part, I have used different ways to improve the model's performance. 
+
+Firstly, I added dummy variables for the `country_name` variable to build predictions on each country and not on an aggregate of all countries. The model was stronger than the baseline model. Indeed, the ROC curve of the training set was closer to the top left corner and further to the 45-degree line, while only a very few points of the ROC curve of the testing set were below the 45-degree line. The AUC of both sets increased with comparison to the baseline model, showing that adding country dummy variables indeed improved the model's performance. 
+
+Secondly, based on the model created in the first part of Part 3, I wanted to find a threshold (different to 0.5) to have more balanced predictions and hopefully have positives predictions as well. For this, I ran a loop to find the threshold that maximises the F1-score (which combines precision and recall and therefore values more a balanced model). For this specific threshold (0.19), the confusion matrices showed that the model now predicted positives as well. Nevertheless, for this threshold, the model is quite good at predicting negatives, but is bad at preddicting positives. The F1-scores were low as well. 
+
+Finally, I added predictors to the model built in the first part of Part 3 to increase the performance of the model. I added other `share_female` laggegd variables and it indeed increased the performance of the model. Indeed, the AUC of both sets increased with comparison to the AUC of the baseline model and the model built in the first part of Part 3. 
+
+
+Ultimately, building a model with only one predictor does not result in a strong model performance (baseline model). Adding other valid predictors to the model increased the performance of the model and I believe that adding more relevant predictors to the model would even more improve the model. 
+
+
+
+
+
+
+
+
+
